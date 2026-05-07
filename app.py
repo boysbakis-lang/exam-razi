@@ -15,8 +15,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 app = Flask(__name__, static_folder='public', static_url_path='/static')
 app.secret_key = 'exam_system_secret_2024_!@#'
 JWT_SECRET = 'jwt_exam_secret_2024'
-import os
-DB_PATH = os.environ.get('DB_PATH', 'data/exam_system.db')
+DB_PATH = 'data/exam_system.db'
 
 # ─── SCHOOL CONFIG ────────────────────────────────────────────────────────────
 SCHOOL_CONFIG = {
@@ -967,5 +966,4 @@ if __name__ == '__main__':
     print("  🌐 URL: http://localhost:5000")
     print("  👤 Admin: admin / admin123")
     print("="*60 + "\n")
-    port = int(os.environ.get('PORT', 8080))
-    app.run(debug=False, host='0.0.0.0', port=port)
+    app.run(debug=True, host='0.0.0.0', port=5000)
