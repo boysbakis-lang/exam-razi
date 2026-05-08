@@ -1075,6 +1075,306 @@ def class_report_pdf(class_name):
     conn.close()
     return send_file(buf, mimetype='application/pdf', download_name=f'class_report_{class_name}.pdf')
 
+
+# ─── HELPER: READ EXCEL OR CSV ───────────────────────────────────────────────
+def read_file_rows(file, key_column):
+    """Read Excel or CSV file and return list of dicts, finding header row by key_column"""
+    filename = file.filename.lower()
+    rows = []
+    if filename.endswith('.xlsx') or filename.endswith('.xls'):
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(file.read()), data_only=True)
+        ws = wb.active
+        headers = []
+        for row in ws.iter_rows(values_only=True):
+            if all(v is None for v in row):
+                continue
+            if not headers:
+                row_vals = [str(v).strip() if v else '' for v in row]
+                if key_column in row_vals:
+                    headers = row_vals
+                continue
+            row_dict = {}
+            for j, val in enumerate(row):
+                if j < len(headers) and headers[j]:
+                    row_dict[headers[j]] = str(val).strip() if val is not None else ''
+            if any(row_dict.get(h) for h in headers[:3]):
+                rows.append(row_dict)
+    else:
+        content = file.read().decode('utf-8-sig')
+        reader = csv.DictReader(io.StringIO(content))
+        rows = [dict(r) for r in reader]
+    return rows
+
+# ─── IMPORT: TEACHERS ────────────────────────────────────────────────────────
+@app.route('/api/teachers/import', methods=['POST'])
+@token_required(['admin'])
+def import_teachers():
+    file = request.files.get('file')
+    if not file:
+        return jsonify({'error': 'No file'}), 400
+    try:
+        rows = read_file_rows(file, 'username')
+    except Exception as e:
+        return jsonify({'error': f'خطأ في قراءة الملف: {str(e)}'}), 400
+
+    conn = get_db()
+    created = 0; skipped = 0; errors = []
+    for row in rows:
+        try:
+            username = str(row.get('username') or '').strip()
+            name_ar  = str(row.get('full_name_ar') or '').strip()
+            if not username and not name_ar:
+                continue
+            if not username:
+                username = f"t{generate_code(5).lower()}"
+            existing = db_fetchone(conn, 'SELECT id FROM users WHERE username=?', (username,))
+            if existing:
+                skipped += 1
+                continue
+            password = str(row.get('password') or '123456').strip() or '123456'
+            db_execute(conn, """INSERT INTO users (username,password_hash,role,full_name_ar,full_name_en,email)
+                                VALUES (?,?,?,?,?,?)""",
+                       (username, hash_password(password), 'teacher',
+                        name_ar, str(row.get('full_name_en') or '').strip(),
+                        str(row.get('email') or '').strip()))
+            created += 1
+        except Exception as e:
+            errors.append(f"{row.get('username','?')}: {str(e)}")
+    conn.commit(); conn.close()
+    return jsonify({'created': created, 'skipped': skipped, 'errors': errors})
+
+# ─── IMPORT: SUBJECTS ────────────────────────────────────────────────────────
+@app.route('/api/subjects/import', methods=['POST'])
+@token_required(['admin'])
+def import_subjects():
+    file = request.files.get('file')
+    if not file:
+        return jsonify({'error': 'No file'}), 400
+    try:
+        rows = read_file_rows(file, 'code')
+    except Exception as e:
+        return jsonify({'error': f'خطأ في قراءة الملف: {str(e)}'}), 400
+
+    conn = get_db()
+    created = 0; skipped = 0; errors = []
+    for row in rows:
+        try:
+            code    = str(row.get('code') or '').strip()
+            name_ar = str(row.get('name_ar') or '').strip()
+            if not code or not name_ar:
+                continue
+            existing = db_fetchone(conn, 'SELECT id FROM subjects WHERE code=?', (code,))
+            if existing:
+                skipped += 1
+                continue
+            # Find teacher by name or username
+            teacher_id = None
+            teacher_name = str(row.get('teacher_username') or '').strip()
+            if teacher_name:
+                t = db_fetchone(conn, 'SELECT id FROM users WHERE username=? AND role=?', (teacher_name, 'teacher'))
+                if t:
+                    teacher_id = t['id']
+            db_execute(conn, """INSERT INTO subjects (name_ar,name_en,code,teacher_id,grade,color,icon)
+                                VALUES (?,?,?,?,?,?,?)""",
+                       (name_ar, str(row.get('name_en') or '').strip(),
+                        code, teacher_id,
+                        str(row.get('grade') or '').strip(),
+                        str(row.get('color') or '#3b82f6').strip(),
+                        str(row.get('icon') or '📚').strip()))
+            created += 1
+        except Exception as e:
+            errors.append(f"{row.get('code','?')}: {str(e)}")
+    conn.commit(); conn.close()
+    return jsonify({'created': created, 'skipped': skipped, 'errors': errors})
+
+# ─── IMPORT: QUESTIONS ───────────────────────────────────────────────────────
+@app.route('/api/questions/import', methods=['POST'])
+@token_required(['admin', 'teacher'])
+def import_questions():
+    file = request.files.get('file')
+    if not file:
+        return jsonify({'error': 'No file'}), 400
+    try:
+        rows = read_file_rows(file, 'question_ar')
+    except Exception as e:
+        return jsonify({'error': f'خطأ في قراءة الملف: {str(e)}'}), 400
+
+    conn = get_db()
+    created = 0; errors = []
+    for row in rows:
+        try:
+            question_ar = str(row.get('question_ar') or '').strip()
+            subject_code = str(row.get('subject_code') or '').strip()
+            if not question_ar or not subject_code:
+                continue
+            subject = db_fetchone(conn, 'SELECT id FROM subjects WHERE code=?', (subject_code,))
+            if not subject:
+                errors.append(f"مادة غير موجودة: {subject_code}")
+                continue
+            qtype = str(row.get('type') or 'mcq').strip().lower()
+            # Build options for MCQ
+            options_ar = []
+            options_en = []
+            correct_answer = str(row.get('correct_answer') or '').strip()
+            if qtype == 'mcq':
+                for i in range(1, 6):
+                    opt = str(row.get(f'option{i}_ar') or row.get(f'option{i}') or '').strip()
+                    opt_en = str(row.get(f'option{i}_en') or '').strip()
+                    if opt:
+                        options_ar.append(opt)
+                        options_en.append(opt_en)
+            db_execute(conn, """INSERT INTO question_bank
+                               (subject_id,question_ar,question_en,type,options_ar,options_en,
+                                correct_answer,points,difficulty,skill_tag,created_by)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                       (subject['id'], question_ar,
+                        str(row.get('question_en') or '').strip(),
+                        qtype,
+                        json.dumps(options_ar, ensure_ascii=False),
+                        json.dumps(options_en, ensure_ascii=False),
+                        correct_answer,
+                        float(row.get('points') or 1),
+                        str(row.get('difficulty') or 'medium').strip(),
+                        str(row.get('skill_tag') or '').strip(),
+                        request.user['user_id']))
+            created += 1
+        except Exception as e:
+            errors.append(f"{row.get('question_ar','?')[:30]}: {str(e)}")
+    conn.commit(); conn.close()
+    return jsonify({'created': created, 'errors': errors})
+
+# ─── BACKUP & RESTORE ────────────────────────────────────────────────────────
+@app.route('/api/backup/download', methods=['GET'])
+@token_required(['admin'])
+def backup_download():
+    """Export all data as JSON backup"""
+    conn = get_db()
+    backup = {
+        'version': '1.0',
+        'created_at': datetime.now().isoformat(),
+        'school': {r['key']: r['value'] for r in db_fetchall(conn, 'SELECT key,value FROM school_settings')},
+        'users': db_fetchall(conn, 'SELECT * FROM users'),
+        'subjects': db_fetchall(conn, 'SELECT * FROM subjects'),
+        'questions': db_fetchall(conn, 'SELECT * FROM question_bank'),
+        'exams': db_fetchall(conn, 'SELECT * FROM exams'),
+        'exam_access': db_fetchall(conn, 'SELECT * FROM exam_access'),
+        'exam_sessions': db_fetchall(conn, 'SELECT * FROM exam_sessions'),
+        'student_answers': db_fetchall(conn, 'SELECT * FROM student_answers'),
+        'exam_results': db_fetchall(conn, 'SELECT * FROM exam_results'),
+    }
+    conn.close()
+    buf = io.BytesIO(json.dumps(backup, ensure_ascii=False, indent=2).encode('utf-8'))
+    buf.seek(0)
+    filename = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    return send_file(buf, mimetype='application/json',
+                     download_name=filename, as_attachment=True)
+
+@app.route('/api/backup/restore', methods=['POST'])
+@token_required(['admin'])
+def backup_restore():
+    """Restore data from JSON backup"""
+    file = request.files.get('file')
+    if not file:
+        return jsonify({'error': 'No file'}), 400
+    try:
+        data = json.loads(file.read().decode('utf-8'))
+    except Exception as e:
+        return jsonify({'error': f'ملف غير صالح: {str(e)}'}), 400
+
+    conn = get_db()
+    restored = {}
+    try:
+        # Restore school settings
+        if 'school' in data:
+            for k, v in data['school'].items():
+                if USE_PG:
+                    conn.cursor().execute('INSERT INTO school_settings VALUES (%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value', (k, v))
+                else:
+                    db_execute(conn, 'INSERT OR REPLACE INTO school_settings VALUES (?,?)', (k, v))
+            restored['school_settings'] = len(data['school'])
+
+        # Restore users
+        if 'users' in data:
+            count = 0
+            for u in data['users']:
+                try:
+                    if USE_PG:
+                        conn.cursor().execute("""INSERT INTO users (username,password_hash,role,full_name_ar,full_name_en,email,student_code,class_name,grade,created_at)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(username) DO NOTHING""",
+                            (u.get('username'),u.get('password_hash'),u.get('role'),u.get('full_name_ar'),
+                             u.get('full_name_en'),u.get('email'),u.get('student_code'),
+                             u.get('class_name'),u.get('grade'),u.get('created_at')))
+                    else:
+                        db_execute(conn, """INSERT OR IGNORE INTO users (username,password_hash,role,full_name_ar,full_name_en,email,student_code,class_name,grade,created_at)
+                            VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                            (u.get('username'),u.get('password_hash'),u.get('role'),u.get('full_name_ar'),
+                             u.get('full_name_en'),u.get('email'),u.get('student_code'),
+                             u.get('class_name'),u.get('grade'),u.get('created_at')))
+                    count += 1
+                except: pass
+            restored['users'] = count
+
+        # Restore subjects
+        if 'subjects' in data:
+            count = 0
+            for s in data['subjects']:
+                try:
+                    if USE_PG:
+                        conn.cursor().execute("""INSERT INTO subjects (name_ar,name_en,code,teacher_id,grade,color,icon)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(code) DO NOTHING""",
+                            (s.get('name_ar'),s.get('name_en'),s.get('code'),s.get('teacher_id'),
+                             s.get('grade'),s.get('color'),s.get('icon')))
+                    else:
+                        db_execute(conn, """INSERT OR IGNORE INTO subjects (name_ar,name_en,code,teacher_id,grade,color,icon)
+                            VALUES (?,?,?,?,?,?,?)""",
+                            (s.get('name_ar'),s.get('name_en'),s.get('code'),s.get('teacher_id'),
+                             s.get('grade'),s.get('color'),s.get('icon')))
+                    count += 1
+                except: pass
+            restored['subjects'] = count
+
+        # Restore questions
+        if 'questions' in data:
+            count = 0
+            for q in data['questions']:
+                try:
+                    db_execute(conn, """INSERT INTO question_bank
+                        (subject_id,question_ar,question_en,type,options_ar,options_en,correct_answer,points,difficulty,skill_tag,created_by,created_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (q.get('subject_id'),q.get('question_ar'),q.get('question_en'),q.get('type'),
+                         q.get('options_ar'),q.get('options_en'),q.get('correct_answer'),q.get('points'),
+                         q.get('difficulty'),q.get('skill_tag'),q.get('created_by'),q.get('created_at')))
+                    count += 1
+                except: pass
+            restored['questions'] = count
+
+        # Restore exams
+        if 'exams' in data:
+            count = 0
+            for e in data['exams']:
+                try:
+                    db_execute(conn, """INSERT INTO exams
+                        (title_ar,title_en,subject_id,teacher_id,instructions_ar,instructions_en,
+                         duration_minutes,total_points,pass_score,start_time,end_time,status,question_ids,
+                         randomize_questions,randomize_options,created_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (e.get('title_ar'),e.get('title_en'),e.get('subject_id'),e.get('teacher_id'),
+                         e.get('instructions_ar'),e.get('instructions_en'),e.get('duration_minutes'),
+                         e.get('total_points'),e.get('pass_score'),e.get('start_time'),e.get('end_time'),
+                         e.get('status'),e.get('question_ids'),e.get('randomize_questions'),
+                         e.get('randomize_options'),e.get('created_at')))
+                    count += 1
+                except: pass
+            restored['exams'] = count
+
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'restored': restored})
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': str(e)}), 500
+
 # ─── SERVE FRONTEND ───────────────────────────────────────────────────────────
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
