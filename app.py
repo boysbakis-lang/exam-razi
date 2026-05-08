@@ -184,18 +184,20 @@ def init_db():
 
     conn.commit()
 
-    # Default admin
+    # Default admin - only if not exists
     admin_hash = hash_password('admin123')
     if USE_PG:
         c.execute('INSERT INTO users (username,password_hash,role,full_name_ar,full_name_en) VALUES (%s,%s,%s,%s,%s) ON CONFLICT(username) DO NOTHING',
                   ('admin', admin_hash, 'admin', 'مدير النظام', 'System Admin'))
+        # Only insert school settings if they don't exist - never overwrite
         for k, v in SCHOOL_CONFIG.items():
-            c.execute('INSERT INTO school_settings VALUES (%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value', (k, str(v)))
+            c.execute('INSERT INTO school_settings VALUES (%s,%s) ON CONFLICT(key) DO NOTHING', (k, str(v)))
     else:
         c.execute('INSERT OR IGNORE INTO users (username,password_hash,role,full_name_ar,full_name_en) VALUES (?,?,?,?,?)',
                   ('admin', admin_hash, 'admin', 'مدير النظام', 'System Admin'))
+        # Only insert school settings if they don't exist - never overwrite
         for k, v in SCHOOL_CONFIG.items():
-            c.execute('INSERT OR REPLACE INTO school_settings VALUES (?,?)', (k, str(v)))
+            c.execute('INSERT OR IGNORE INTO school_settings VALUES (?,?)', (k, str(v)))
 
     conn.commit()
     conn.close()
