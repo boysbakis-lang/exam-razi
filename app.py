@@ -1,5 +1,14 @@
 from flask import Flask, request, jsonify, session, send_file, render_template_string
-import sqlite3, json, os, random, string, hashlib, jwt, csv, io
+import json, os, random, string, hashlib, jwt, csv, io
+
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
+if DATABASE_URL:
+    import psycopg2
+    import psycopg2.extras
+    USE_PG = True
+else:
+    import sqlite3
+    USE_PG = False
 from datetime import datetime, timedelta
 from functools import wraps
 from reportlab.lib.pagesizes import A4
@@ -15,7 +24,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 app = Flask(__name__, static_folder='public', static_url_path='/static')
 app.secret_key = 'exam_system_secret_2024_!@#'
 JWT_SECRET = 'jwt_exam_secret_2024'
-DB_PATH = 'data/exam_system.db'
+DB_PATH = os.environ.get('DB_PATH', 'data/exam_system.db')
 
 # ─── SCHOOL CONFIG ────────────────────────────────────────────────────────────
 SCHOOL_CONFIG = {
@@ -31,10 +40,31 @@ SCHOOL_CONFIG = {
 
 # ─── DATABASE ─────────────────────────────────────────────────────────────────
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    if USE_PG:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = False
+        return conn
+    else:
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(DB_PATH)
+        conn.row_factory = _sqlite3.Row
+        db_execute(conn, "PRAGMA journal_mode=WAL")
+        return conn
+
+def fetchall(cursor):
+    if USE_PG:
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+    return [dict(r) for r in cursor.fetchall()]
+
+def fetchone(cursor):
+    if USE_PG:
+        row = cursor.fetchone()
+        if row is None: return None
+        cols = [d[0] for d in cursor.description]
+        return dict(zip(cols, row))
+    row = cursor.fetchone()
+    return dict(row) if row else None
 
 def init_db():
     os.makedirs('data', exist_ok=True)
@@ -42,53 +72,47 @@ def init_db():
     conn = get_db()
     c = conn.cursor()
 
-    c.executescript('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tables = [
+        '''CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
-            role TEXT NOT NULL, -- admin, teacher, student
+            role TEXT NOT NULL,
             full_name_ar TEXT,
             full_name_en TEXT,
             email TEXT,
             student_code TEXT UNIQUE,
             class_name TEXT,
             grade TEXT,
-            created_at TEXT DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS subjects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT DEFAULT 'now'
+        )''',
+        '''CREATE TABLE IF NOT EXISTS subjects (
+            id SERIAL PRIMARY KEY,
             name_ar TEXT NOT NULL,
             name_en TEXT NOT NULL,
             code TEXT UNIQUE NOT NULL,
             teacher_id INTEGER,
             grade TEXT,
             color TEXT DEFAULT '#3b82f6',
-            icon TEXT DEFAULT '📚',
-            FOREIGN KEY(teacher_id) REFERENCES users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS question_bank (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            icon TEXT DEFAULT '📚'
+        )''',
+        '''CREATE TABLE IF NOT EXISTS question_bank (
+            id SERIAL PRIMARY KEY,
             subject_id INTEGER NOT NULL,
             question_ar TEXT NOT NULL,
             question_en TEXT,
-            type TEXT NOT NULL, -- mcq, true_false, essay
-            options_ar TEXT, -- JSON array
-            options_en TEXT, -- JSON array
+            type TEXT NOT NULL,
+            options_ar TEXT,
+            options_en TEXT,
             correct_answer TEXT,
-            points INTEGER DEFAULT 1,
-            difficulty TEXT DEFAULT 'medium', -- easy, medium, hard
+            points REAL DEFAULT 1,
+            difficulty TEXT DEFAULT 'medium',
             skill_tag TEXT,
             created_by INTEGER,
-            created_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY(subject_id) REFERENCES subjects(id),
-            FOREIGN KEY(created_by) REFERENCES users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS exams (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT DEFAULT 'now'
+        )''',
+        '''CREATE TABLE IF NOT EXISTS exams (
+            id SERIAL PRIMARY KEY,
             title_ar TEXT NOT NULL,
             title_en TEXT,
             subject_id INTEGER NOT NULL,
@@ -100,54 +124,42 @@ def init_db():
             pass_score INTEGER DEFAULT 50,
             start_time TEXT,
             end_time TEXT,
-            status TEXT DEFAULT 'draft', -- draft, active, closed
-            question_ids TEXT, -- JSON array
+            status TEXT DEFAULT 'draft',
+            question_ids TEXT,
             randomize_questions INTEGER DEFAULT 0,
             randomize_options INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY(subject_id) REFERENCES subjects(id),
-            FOREIGN KEY(teacher_id) REFERENCES users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS exam_access (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT DEFAULT 'now'
+        )''',
+        '''CREATE TABLE IF NOT EXISTS exam_access (
+            id SERIAL PRIMARY KEY,
             exam_id INTEGER NOT NULL,
             student_id INTEGER NOT NULL,
             access_code TEXT UNIQUE NOT NULL,
             used INTEGER DEFAULT 0,
-            used_at TEXT,
-            FOREIGN KEY(exam_id) REFERENCES exams(id),
-            FOREIGN KEY(student_id) REFERENCES users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS exam_sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            used_at TEXT
+        )''',
+        '''CREATE TABLE IF NOT EXISTS exam_sessions (
+            id SERIAL PRIMARY KEY,
             exam_id INTEGER NOT NULL,
             student_id INTEGER NOT NULL,
-            start_time TEXT DEFAULT (datetime('now')),
+            start_time TEXT DEFAULT 'now',
             end_time TEXT,
-            status TEXT DEFAULT 'in_progress', -- in_progress, submitted, timed_out
-            time_remaining INTEGER,
-            FOREIGN KEY(exam_id) REFERENCES exams(id),
-            FOREIGN KEY(student_id) REFERENCES users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS student_answers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            status TEXT DEFAULT 'in_progress',
+            time_remaining INTEGER
+        )''',
+        '''CREATE TABLE IF NOT EXISTS student_answers (
+            id SERIAL PRIMARY KEY,
             session_id INTEGER NOT NULL,
             question_id INTEGER NOT NULL,
             answer TEXT,
             is_correct INTEGER,
             points_earned REAL DEFAULT 0,
-            teacher_grade REAL, -- for essay questions
+            teacher_grade REAL,
             teacher_feedback TEXT,
-            answered_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY(session_id) REFERENCES exam_sessions(id),
-            FOREIGN KEY(question_id) REFERENCES question_bank(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS exam_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            answered_at TEXT DEFAULT 'now'
+        )''',
+        '''CREATE TABLE IF NOT EXISTS exam_results (
+            id SERIAL PRIMARY KEY,
             session_id INTEGER NOT NULL,
             student_id INTEGER NOT NULL,
             exam_id INTEGER NOT NULL,
@@ -155,33 +167,85 @@ def init_db():
             percentage REAL DEFAULT 0,
             grade_letter TEXT,
             passed INTEGER DEFAULT 0,
-            submitted_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY(session_id) REFERENCES exam_sessions(id),
-            FOREIGN KEY(student_id) REFERENCES users(id),
-            FOREIGN KEY(exam_id) REFERENCES exams(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS school_settings (
+            submitted_at TEXT DEFAULT 'now'
+        )''',
+        '''CREATE TABLE IF NOT EXISTS school_settings (
             key TEXT PRIMARY KEY,
             value TEXT
-        );
-    ''')
+        )'''
+    ]
+
+    for sql in tables:
+        if USE_PG:
+            c.execute(sql)
+        else:
+            import sqlite3 as _sq
+            db_execute(conn, sql.replace('SERIAL PRIMARY KEY', 'INTEGER PRIMARY KEY AUTOINCREMENT'))
+
+    conn.commit()
 
     # Default admin
     admin_hash = hash_password('admin123')
-    c.execute('''INSERT OR IGNORE INTO users (username, password_hash, role, full_name_ar, full_name_en)
-                 VALUES (?, ?, ?, ?, ?)''',
-              ('admin', admin_hash, 'admin', 'مدير النظام', 'System Admin'))
-
-    # Save school config
-    for k, v in SCHOOL_CONFIG.items():
-        c.execute('INSERT OR REPLACE INTO school_settings VALUES (?, ?)', (k, str(v)))
+    if USE_PG:
+        c.execute('INSERT INTO users (username,password_hash,role,full_name_ar,full_name_en) VALUES (%s,%s,%s,%s,%s) ON CONFLICT(username) DO NOTHING',
+                  ('admin', admin_hash, 'admin', 'مدير النظام', 'System Admin'))
+        for k, v in SCHOOL_CONFIG.items():
+            c.execute('INSERT INTO school_settings VALUES (%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value', (k, str(v)))
+    else:
+        c.execute('INSERT OR IGNORE INTO users (username,password_hash,role,full_name_ar,full_name_en) VALUES (?,?,?,?,?)',
+                  ('admin', admin_hash, 'admin', 'مدير النظام', 'System Admin'))
+        for k, v in SCHOOL_CONFIG.items():
+            c.execute('INSERT OR REPLACE INTO school_settings VALUES (?,?)', (k, str(v)))
 
     conn.commit()
     conn.close()
 
 def hash_password(pwd):
     return hashlib.sha256(pwd.encode()).hexdigest()
+
+def qmark(sql):
+    """Convert ? placeholders to %s for PostgreSQL"""
+    if USE_PG:
+        return sql.replace('?', '%s')
+    return sql
+
+def db_fetchall(conn, sql, params=()):
+    c = conn.cursor()
+    c.execute(qmark(sql), params)
+    if USE_PG:
+        cols = [d[0] for d in c.description]
+        return [dict(zip(cols, row)) for row in c.fetchall()]
+    return [dict(r) for r in c.fetchall()]
+
+def db_fetchone(conn, sql, params=()):
+    c = conn.cursor()
+    c.execute(qmark(sql), params)
+    if USE_PG:
+        row = c.fetchone()
+        if row is None: return None
+        cols = [d[0] for d in c.description]
+        return dict(zip(cols, row))
+    row = c.fetchone()
+    return dict(row) if row else None
+
+def db_execute(conn, sql, params=()):
+    c = conn.cursor()
+    c.execute(qmark(sql), params)
+    return c
+
+def db_execute_returning(conn, sql, params=()):
+    """Execute INSERT and return lastrowid"""
+    c = conn.cursor()
+    if USE_PG:
+        sql2 = qmark(sql)
+        if 'RETURNING' not in sql2.upper():
+            sql2 += ' RETURNING id'
+        c.execute(sql2, params)
+        row = c.fetchone()
+        return row[0] if row else None
+    else:
+        c.execute(sql, params)
+        return c.lastrowid
 
 def generate_code(length=8):
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
@@ -217,7 +281,7 @@ def token_required(roles=None):
 def login():
     data = request.json
     conn = get_db()
-    user = conn.execute('SELECT * FROM users WHERE username=?', (data['username'],)).fetchone()
+    user = db_fetchone(conn, 'SELECT * FROM users WHERE username=?', (data['username'],))
     conn.close()
     if not user or user['password_hash'] != hash_password(data['password']):
         return jsonify({'error': 'بيانات الدخول غير صحيحة / Invalid credentials'}), 401
@@ -229,7 +293,7 @@ def login():
 @token_required()
 def me():
     conn = get_db()
-    user = conn.execute('SELECT id, username, role, full_name_ar, full_name_en, email, class_name, grade FROM users WHERE id=?',
+    user = db_execute(conn, 'SELECT id, username, role, full_name_ar, full_name_en, email, class_name, grade FROM users WHERE id=?',
                         (request.user['user_id'],)).fetchone()
     conn.close()
     return jsonify(dict(user))
@@ -238,7 +302,7 @@ def me():
 @app.route('/api/settings', methods=['GET'])
 def get_settings():
     conn = get_db()
-    rows = conn.execute('SELECT key, value FROM school_settings').fetchall()
+    rows = db_fetchall(conn, 'SELECT key, value FROM school_settings')
     conn.close()
     return jsonify({r['key']: r['value'] for r in rows})
 
@@ -248,7 +312,7 @@ def update_settings():
     data = request.json
     conn = get_db()
     for k, v in data.items():
-        conn.execute('INSERT OR REPLACE INTO school_settings VALUES (?, ?)', (k, str(v)))
+        db_execute(conn, 'INSERT OR REPLACE INTO school_settings VALUES (?, ?)', (k, str(v)))
     conn.commit()
     conn.close()
     return jsonify({'success': True})
@@ -260,9 +324,9 @@ def get_users():
     role = request.args.get('role', '')
     conn = get_db()
     if role:
-        users = conn.execute('SELECT id, username, role, full_name_ar, full_name_en, email, student_code, class_name, grade FROM users WHERE role=? ORDER BY full_name_ar', (role,)).fetchall()
+        users = db_fetchall(conn, 'SELECT id, username, role, full_name_ar, full_name_en, email, student_code, class_name, grade FROM users WHERE role=? ORDER BY full_name_ar', (role,))
     else:
-        users = conn.execute('SELECT id, username, role, full_name_ar, full_name_en, email, student_code, class_name, grade FROM users ORDER BY role, full_name_ar').fetchall()
+        users = db_fetchall(conn, 'SELECT id, username, role, full_name_ar, full_name_en, email, student_code, class_name, grade FROM users ORDER BY role, full_name_ar')
     conn.close()
     return jsonify([dict(u) for u in users])
 
@@ -273,7 +337,7 @@ def create_user():
     conn = get_db()
     code = generate_code(6) if data.get('role') == 'student' else None
     try:
-        conn.execute('''INSERT INTO users (username, password_hash, role, full_name_ar, full_name_en, email, student_code, class_name, grade)
+        db_execute(conn, '''INSERT INTO users (username, password_hash, role, full_name_ar, full_name_en, email, student_code, class_name, grade)
                        VALUES (?,?,?,?,?,?,?,?,?)''',
                     (data['username'], hash_password(data.get('password', '123456')),
                      data['role'], data.get('full_name_ar'), data.get('full_name_en'),
@@ -300,7 +364,7 @@ def update_user(uid):
         fields.append('password_hash=?')
         vals.append(hash_password(data['password']))
     vals.append(uid)
-    conn.execute(f'UPDATE users SET {", ".join(fields)} WHERE id=?', vals)
+    db_execute(conn, f'UPDATE users SET {", ".join(fields)} WHERE id=?', vals)
     conn.commit()
     conn.close()
     return jsonify({'success': True})
@@ -309,7 +373,7 @@ def update_user(uid):
 @token_required(['admin'])
 def delete_user(uid):
     conn = get_db()
-    conn.execute('DELETE FROM users WHERE id=?', (uid,))
+    db_execute(conn, 'DELETE FROM users WHERE id=?', (uid,))
     conn.commit()
     conn.close()
     return jsonify({'success': True})
@@ -320,33 +384,92 @@ def import_students():
     file = request.files.get('file')
     if not file:
         return jsonify({'error': 'No file'}), 400
-    content = file.read().decode('utf-8-sig')
-    reader = csv.DictReader(io.StringIO(content))
+
+    filename = file.filename.lower()
+    rows = []
+
+    try:
+        if filename.endswith('.xlsx') or filename.endswith('.xls'):
+            # Read Excel file
+            import openpyxl
+            file_bytes = io.BytesIO(file.read())
+            wb = openpyxl.load_workbook(file_bytes, data_only=True)
+            ws = wb.active
+            headers = []
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                # Skip empty rows
+                if all(v is None for v in row):
+                    continue
+                # Find header row (contains 'username')
+                if not headers:
+                    row_vals = [str(v).strip() if v else '' for v in row]
+                    if 'username' in row_vals:
+                        headers = row_vals
+                    continue
+                # Data row
+                row_dict = {}
+                for j, val in enumerate(row):
+                    if j < len(headers) and headers[j]:
+                        row_dict[headers[j]] = str(val).strip() if val is not None else ''
+                if row_dict.get('username') or row_dict.get('full_name_ar'):
+                    rows.append(row_dict)
+        else:
+            # Read CSV file
+            content = file.read().decode('utf-8-sig')
+            reader = csv.DictReader(io.StringIO(content))
+            for row in reader:
+                rows.append(dict(row))
+    except Exception as e:
+        return jsonify({'error': f'خطأ في قراءة الملف: {str(e)}'}), 400
+
     conn = get_db()
     created = 0
+    skipped = 0
     errors = []
-    for row in reader:
+
+    for row in rows:
         try:
+            username = str(row.get('username') or '').strip()
+            name_ar = str(row.get('full_name_ar') or '').strip()
+
+            if not username and not name_ar:
+                continue
+
+            if not username:
+                username = f"st{generate_code(6).lower()}"
+
+            # Check if username already exists
+            existing = db_fetchone(conn, 'SELECT id FROM users WHERE username=?', (username,))
+            if existing:
+                skipped += 1
+                continue
+
             code = generate_code(6)
-            username = row.get('username') or f"st{generate_code(6).lower()}"
-            conn.execute('''INSERT OR IGNORE INTO users (username, password_hash, role, full_name_ar, full_name_en, email, student_code, class_name, grade)
+            password = str(row.get('password') or '123456').strip() or '123456'
+
+            db_execute(conn, '''INSERT INTO users (username, password_hash, role, full_name_ar, full_name_en, email, student_code, class_name, grade)
                            VALUES (?,?,?,?,?,?,?,?,?)''',
-                        (username, hash_password(row.get('password', '123456')),
-                         'student', row.get('full_name_ar', ''), row.get('full_name_en', ''),
-                         row.get('email', ''), code, row.get('class_name', ''), row.get('grade', '')))
+                        (username, hash_password(password),
+                         'student', name_ar,
+                         str(row.get('full_name_en') or '').strip(),
+                         str(row.get('email') or '').strip(),
+                         code,
+                         str(row.get('class_name') or '').strip(),
+                         str(row.get('grade') or '').strip()))
             created += 1
         except Exception as e:
-            errors.append(str(e))
+            errors.append(f"{row.get('username','?')}: {str(e)}")
+
     conn.commit()
     conn.close()
-    return jsonify({'created': created, 'errors': errors})
+    return jsonify({'created': created, 'skipped': skipped, 'errors': errors})
 
 # ─── ROUTES: SUBJECTS ─────────────────────────────────────────────────────────
 @app.route('/api/subjects', methods=['GET'])
 @token_required()
 def get_subjects():
     conn = get_db()
-    subjects = conn.execute('''SELECT s.*, u.full_name_ar as teacher_name
+    subjects = db_execute(conn, '''SELECT s.*, u.full_name_ar as teacher_name
                                FROM subjects s LEFT JOIN users u ON s.teacher_id=u.id
                                ORDER BY s.name_ar''').fetchall()
     conn.close()
@@ -358,7 +481,7 @@ def create_subject():
     data = request.json
     conn = get_db()
     try:
-        conn.execute('INSERT INTO subjects (name_ar, name_en, code, teacher_id, grade, color, icon) VALUES (?,?,?,?,?,?,?)',
+        db_execute(conn, 'INSERT INTO subjects (name_ar, name_en, code, teacher_id, grade, color, icon) VALUES (?,?,?,?,?,?,?)',
                     (data['name_ar'], data.get('name_en'), data['code'],
                      data.get('teacher_id'), data.get('grade'),
                      data.get('color', '#3b82f6'), data.get('icon', '📚')))
@@ -374,7 +497,7 @@ def create_subject():
 def update_subject(sid):
     data = request.json
     conn = get_db()
-    conn.execute('UPDATE subjects SET name_ar=?, name_en=?, teacher_id=?, grade=?, color=?, icon=? WHERE id=?',
+    db_execute(conn, 'UPDATE subjects SET name_ar=?, name_en=?, teacher_id=?, grade=?, color=?, icon=? WHERE id=?',
                 (data['name_ar'], data.get('name_en'), data.get('teacher_id'),
                  data.get('grade'), data.get('color'), data.get('icon'), sid))
     conn.commit()
@@ -385,7 +508,7 @@ def update_subject(sid):
 @token_required(['admin'])
 def delete_subject(sid):
     conn = get_db()
-    conn.execute('DELETE FROM subjects WHERE id=?', (sid,))
+    db_execute(conn, 'DELETE FROM subjects WHERE id=?', (sid,))
     conn.commit()
     conn.close()
     return jsonify({'success': True})
@@ -397,9 +520,9 @@ def get_questions():
     subject_id = request.args.get('subject_id')
     conn = get_db()
     if subject_id:
-        qs = conn.execute('SELECT q.*, s.name_ar as subject_name FROM question_bank q JOIN subjects s ON q.subject_id=s.id WHERE q.subject_id=? ORDER BY q.id DESC', (subject_id,)).fetchall()
+        qs = db_fetchall(conn, 'SELECT q.*, s.name_ar as subject_name FROM question_bank q JOIN subjects s ON q.subject_id=s.id WHERE q.subject_id=? ORDER BY q.id DESC', (subject_id,))
     else:
-        qs = conn.execute('SELECT q.*, s.name_ar as subject_name FROM question_bank q JOIN subjects s ON q.subject_id=s.id ORDER BY q.id DESC').fetchall()
+        qs = db_fetchall(conn, 'SELECT q.*, s.name_ar as subject_name FROM question_bank q JOIN subjects s ON q.subject_id=s.id ORDER BY q.id DESC')
     conn.close()
     return jsonify([dict(q) for q in qs])
 
@@ -408,7 +531,7 @@ def get_questions():
 def create_question():
     data = request.json
     conn = get_db()
-    conn.execute('''INSERT INTO question_bank (subject_id, question_ar, question_en, type, options_ar, options_en, correct_answer, points, difficulty, skill_tag, created_by)
+    db_execute(conn, '''INSERT INTO question_bank (subject_id, question_ar, question_en, type, options_ar, options_en, correct_answer, points, difficulty, skill_tag, created_by)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
                 (data['subject_id'], data['question_ar'], data.get('question_en'),
                  data['type'], json.dumps(data.get('options_ar', [])),
@@ -425,7 +548,7 @@ def create_question():
 def update_question(qid):
     data = request.json
     conn = get_db()
-    conn.execute('''UPDATE question_bank SET subject_id=?, question_ar=?, question_en=?, type=?,
+    db_execute(conn, '''UPDATE question_bank SET subject_id=?, question_ar=?, question_en=?, type=?,
                    options_ar=?, options_en=?, correct_answer=?, points=?, difficulty=?, skill_tag=?
                    WHERE id=?''',
                 (data['subject_id'], data['question_ar'], data.get('question_en'),
@@ -441,7 +564,7 @@ def update_question(qid):
 @token_required(['admin', 'teacher'])
 def delete_question(qid):
     conn = get_db()
-    conn.execute('DELETE FROM question_bank WHERE id=?', (qid,))
+    db_execute(conn, 'DELETE FROM question_bank WHERE id=?', (qid,))
     conn.commit()
     conn.close()
     return jsonify({'success': True})
@@ -454,11 +577,11 @@ def get_exams():
     uid = request.user['user_id']
     role = request.user['role']
     if role == 'admin':
-        exams = conn.execute('''SELECT e.*, s.name_ar as subject_name, u.full_name_ar as teacher_name
+        exams = db_execute(conn, '''SELECT e.*, s.name_ar as subject_name, u.full_name_ar as teacher_name
                                 FROM exams e JOIN subjects s ON e.subject_id=s.id
                                 JOIN users u ON e.teacher_id=u.id ORDER BY e.created_at DESC''').fetchall()
     else:
-        exams = conn.execute('''SELECT e.*, s.name_ar as subject_name, u.full_name_ar as teacher_name
+        exams = db_execute(conn, '''SELECT e.*, s.name_ar as subject_name, u.full_name_ar as teacher_name
                                 FROM exams e JOIN subjects s ON e.subject_id=s.id
                                 JOIN users u ON e.teacher_id=u.id
                                 WHERE e.teacher_id=? ORDER BY e.created_at DESC''', (uid,)).fetchall()
@@ -470,7 +593,7 @@ def get_exams():
 def create_exam():
     data = request.json
     conn = get_db()
-    cursor = conn.execute('''INSERT INTO exams (title_ar, title_en, subject_id, teacher_id, instructions_ar, instructions_en,
+    cursor = db_execute(conn, '''INSERT INTO exams (title_ar, title_en, subject_id, teacher_id, instructions_ar, instructions_en,
                              duration_minutes, total_points, pass_score, start_time, end_time, question_ids,
                              randomize_questions, randomize_options)
                              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
@@ -482,7 +605,7 @@ def create_exam():
                           1 if data.get('randomize_questions') else 0,
                           1 if data.get('randomize_options') else 0))
     conn.commit()
-    exam_id = cursor.lastrowid
+    exam_id = cursor.lastrowid if not USE_PG else cursor
     conn.close()
     return jsonify({'success': True, 'exam_id': exam_id})
 
@@ -491,7 +614,7 @@ def create_exam():
 def update_exam(eid):
     data = request.json
     conn = get_db()
-    conn.execute('''UPDATE exams SET title_ar=?, title_en=?, subject_id=?, instructions_ar=?, instructions_en=?,
+    db_execute(conn, '''UPDATE exams SET title_ar=?, title_en=?, subject_id=?, instructions_ar=?, instructions_en=?,
                    duration_minutes=?, total_points=?, pass_score=?, start_time=?, end_time=?,
                    question_ids=?, randomize_questions=?, randomize_options=?, status=?
                    WHERE id=?''',
@@ -511,7 +634,7 @@ def update_exam(eid):
 @token_required(['admin', 'teacher'])
 def delete_exam(eid):
     conn = get_db()
-    conn.execute('DELETE FROM exams WHERE id=?', (eid,))
+    db_execute(conn, 'DELETE FROM exams WHERE id=?', (eid,))
     conn.commit()
     conn.close()
     return jsonify({'success': True})
@@ -526,18 +649,18 @@ def generate_codes(eid):
     codes = []
     for sid in student_ids:
         # Check if code already exists
-        existing = conn.execute('SELECT access_code FROM exam_access WHERE exam_id=? AND student_id=?', (eid, sid)).fetchone()
+        existing = db_fetchone(conn, 'SELECT access_code FROM exam_access WHERE exam_id=? AND student_id=?', (eid, sid))
         if existing:
             codes.append({'student_id': sid, 'code': existing['access_code']})
         else:
             code = generate_code(8)
-            conn.execute('INSERT INTO exam_access (exam_id, student_id, access_code) VALUES (?,?,?)', (eid, sid, code))
+            db_execute(conn, 'INSERT INTO exam_access (exam_id, student_id, access_code) VALUES (?,?,?)', (eid, sid, code))
             codes.append({'student_id': sid, 'code': code})
     conn.commit()
     # Enrich with student names
     result = []
     for c in codes:
-        student = conn.execute('SELECT full_name_ar, class_name FROM users WHERE id=?', (c['student_id'],)).fetchone()
+        student = db_fetchone(conn, 'SELECT full_name_ar, class_name FROM users WHERE id=?', (c['student_id'],))
         result.append({**c, 'name': student['full_name_ar'] if student else '', 'class': student['class_name'] if student else ''})
     conn.close()
     return jsonify(result)
@@ -549,7 +672,7 @@ def enter_exam():
     data = request.json
     code = data.get('code', '').strip().upper()
     conn = get_db()
-    access = conn.execute('''SELECT ea.*, e.title_ar, e.duration_minutes, e.status, e.start_time, e.end_time
+    access = db_execute(conn, '''SELECT ea.*, e.title_ar, e.duration_minutes, e.status, e.start_time, e.end_time
                              FROM exam_access ea JOIN exams e ON ea.exam_id=e.id
                              WHERE ea.access_code=?''', (code,)).fetchone()
     if not access:
@@ -563,7 +686,7 @@ def enter_exam():
         return jsonify({'error': 'الامتحان غير متاح الآن / Exam not available'}), 400
 
     # Check if student already has a session
-    existing_session = conn.execute('''SELECT es.* FROM exam_sessions es
+    existing_session = db_execute(conn, '''SELECT es.* FROM exam_sessions es
                                        WHERE es.exam_id=? AND es.student_id=? AND es.status='in_progress' ''',
                                    (access['exam_id'], access['student_id'])).fetchone()
     if existing_session:
@@ -573,10 +696,10 @@ def enter_exam():
                         'exam_id': access['exam_id'], 'resume': True})
 
     # Create session
-    session_cursor = conn.execute('INSERT INTO exam_sessions (exam_id, student_id) VALUES (?,?)',
+    session_cursor = db_execute(conn, 'INSERT INTO exam_sessions (exam_id, student_id) VALUES (?,?)',
                                   (access['exam_id'], access['student_id']))
-    session_id = session_cursor.lastrowid
-    conn.execute('UPDATE exam_access SET used=1, used_at=datetime("now") WHERE access_code=?', (code,))
+    session_id = session_cursor if USE_PG else session_cursor.lastrowid
+    db_execute(conn, 'UPDATE exam_access SET used=1, used_at=datetime("now") WHERE access_code=?', (code,))
     conn.commit()
     conn.close()
     token = create_token(access['student_id'], 'student')
@@ -586,13 +709,13 @@ def enter_exam():
 @token_required(['student'])
 def get_exam_questions(session_id):
     conn = get_db()
-    session_row = conn.execute('SELECT * FROM exam_sessions WHERE id=? AND student_id=?',
+    session_row = db_execute(conn, 'SELECT * FROM exam_sessions WHERE id=? AND student_id=?',
                                (session_id, request.user['user_id'])).fetchone()
     if not session_row:
         conn.close()
         return jsonify({'error': 'Session not found'}), 404
 
-    exam = conn.execute('SELECT * FROM exams WHERE id=?', (session_row['exam_id'],)).fetchone()
+    exam = db_fetchone(conn, 'SELECT * FROM exams WHERE id=?', (session_row['exam_id'],))
     question_ids = json.loads(exam['question_ids'])
 
     if exam['randomize_questions']:
@@ -600,7 +723,7 @@ def get_exam_questions(session_id):
 
     questions = []
     for qid in question_ids:
-        q = conn.execute('SELECT * FROM question_bank WHERE id=?', (qid,)).fetchone()
+        q = db_fetchone(conn, 'SELECT * FROM question_bank WHERE id=?', (qid,))
         if q:
             qd = dict(q)
             qd['options_ar'] = json.loads(q['options_ar'] or '[]')
@@ -621,7 +744,7 @@ def get_exam_questions(session_id):
     time_remaining = max(0, exam['duration_minutes'] * 60 - elapsed)
 
     # Get existing answers
-    answers = conn.execute('SELECT question_id, answer FROM student_answers WHERE session_id=?', (session_id,)).fetchall()
+    answers = db_fetchall(conn, 'SELECT question_id, answer FROM student_answers WHERE session_id=?', (session_id,))
     answers_map = {a['question_id']: a['answer'] for a in answers}
 
     conn.close()
@@ -640,13 +763,13 @@ def save_answer(session_id):
     data = request.json
     conn = get_db()
     # Check/upsert answer
-    existing = conn.execute('SELECT id FROM student_answers WHERE session_id=? AND question_id=?',
+    existing = db_execute(conn, 'SELECT id FROM student_answers WHERE session_id=? AND question_id=?',
                             (session_id, data['question_id'])).fetchone()
     if existing:
-        conn.execute('UPDATE student_answers SET answer=?, answered_at=datetime("now") WHERE session_id=? AND question_id=?',
+        db_execute(conn, 'UPDATE student_answers SET answer=?, answered_at=datetime("now") WHERE session_id=? AND question_id=?',
                     (data['answer'], session_id, data['question_id']))
     else:
-        conn.execute('INSERT INTO student_answers (session_id, question_id, answer) VALUES (?,?,?)',
+        db_execute(conn, 'INSERT INTO student_answers (session_id, question_id, answer) VALUES (?,?,?)',
                     (session_id, data['question_id'], data['answer']))
     conn.commit()
     conn.close()
@@ -656,34 +779,34 @@ def save_answer(session_id):
 @token_required(['student'])
 def submit_exam(session_id):
     conn = get_db()
-    session_row = conn.execute('SELECT * FROM exam_sessions WHERE id=? AND student_id=?',
+    session_row = db_execute(conn, 'SELECT * FROM exam_sessions WHERE id=? AND student_id=?',
                                (session_id, request.user['user_id'])).fetchone()
     if not session_row:
         conn.close()
         return jsonify({'error': 'Session not found'}), 404
 
-    exam = conn.execute('SELECT * FROM exams WHERE id=?', (session_row['exam_id'],)).fetchone()
-    answers = conn.execute('SELECT * FROM student_answers WHERE session_id=?', (session_id,)).fetchall()
+    exam = db_fetchone(conn, 'SELECT * FROM exams WHERE id=?', (session_row['exam_id'],))
+    answers = db_fetchall(conn, 'SELECT * FROM student_answers WHERE session_id=?', (session_id,))
 
     total_score = 0
     for ans in answers:
-        q = conn.execute('SELECT * FROM question_bank WHERE id=?', (ans['question_id'],)).fetchone()
+        q = db_fetchone(conn, 'SELECT * FROM question_bank WHERE id=?', (ans['question_id'],))
         if q and q['type'] != 'essay':
             correct = str(q['correct_answer']).strip().lower()
             given = str(ans['answer'] or '').strip().lower()
             is_correct = 1 if correct == given else 0
             pts = q['points'] if is_correct else 0
             total_score += pts
-            conn.execute('UPDATE student_answers SET is_correct=?, points_earned=? WHERE id=?',
+            db_execute(conn, 'UPDATE student_answers SET is_correct=?, points_earned=? WHERE id=?',
                         (is_correct, pts, ans['id']))
 
     percentage = (total_score / exam['total_points'] * 100) if exam['total_points'] > 0 else 0
     passed = 1 if percentage >= exam['pass_score'] else 0
     grade_letter = get_grade_letter(percentage)
 
-    conn.execute('UPDATE exam_sessions SET status=?, end_time=datetime("now") WHERE id=?',
+    db_execute(conn, 'UPDATE exam_sessions SET status=?, end_time=datetime("now") WHERE id=?',
                 ('submitted', session_id))
-    conn.execute('''INSERT OR REPLACE INTO exam_results (session_id, student_id, exam_id, total_score, percentage, grade_letter, passed)
+    db_execute(conn, '''INSERT OR REPLACE INTO exam_results (session_id, student_id, exam_id, total_score, percentage, grade_letter, passed)
                    VALUES (?,?,?,?,?,?,?)''',
                 (session_id, request.user['user_id'], session_row['exam_id'],
                  total_score, percentage, grade_letter, passed))
@@ -708,7 +831,7 @@ def get_grade_letter(pct):
 @token_required(['admin', 'teacher'])
 def exam_results(eid):
     conn = get_db()
-    results = conn.execute('''SELECT er.*, u.full_name_ar, u.class_name, u.grade,
+    results = db_execute(conn, '''SELECT er.*, u.full_name_ar, u.class_name, u.grade,
                               es.start_time, es.end_time
                               FROM exam_results er
                               JOIN users u ON er.student_id=u.id
@@ -724,7 +847,7 @@ def student_results(sid):
     if request.user['role'] == 'student' and request.user['user_id'] != sid:
         return jsonify({'error': 'Forbidden'}), 403
     conn = get_db()
-    results = conn.execute('''SELECT er.*, e.title_ar, e.total_points, e.pass_score,
+    results = db_execute(conn, '''SELECT er.*, e.title_ar, e.total_points, e.pass_score,
                               s.name_ar as subject_name, s.color as subject_color
                               FROM exam_results er
                               JOIN exams e ON er.exam_id=e.id
@@ -738,22 +861,22 @@ def student_results(sid):
 def analytics_overview():
     conn = get_db()
     stats = {
-        'total_students': conn.execute("SELECT COUNT(*) FROM users WHERE role='student'").fetchone()[0],
-        'total_teachers': conn.execute("SELECT COUNT(*) FROM users WHERE role='teacher'").fetchone()[0],
-        'total_exams': conn.execute("SELECT COUNT(*) FROM exams").fetchone()[0],
-        'total_questions': conn.execute("SELECT COUNT(*) FROM question_bank").fetchone()[0],
-        'active_exams': conn.execute("SELECT COUNT(*) FROM exams WHERE status='active'").fetchone()[0],
-        'total_submissions': conn.execute("SELECT COUNT(*) FROM exam_results").fetchone()[0],
-        'avg_score': conn.execute("SELECT AVG(percentage) FROM exam_results").fetchone()[0] or 0,
+        'total_students': db_fetchone(conn, "SELECT COUNT(*) FROM users WHERE role='student'")[0],
+        'total_teachers': db_fetchone(conn, "SELECT COUNT(*) FROM users WHERE role='teacher'")[0],
+        'total_exams': db_fetchone(conn, "SELECT COUNT(*) FROM exams")[0],
+        'total_questions': db_fetchone(conn, "SELECT COUNT(*) FROM question_bank")[0],
+        'active_exams': db_fetchone(conn, "SELECT COUNT(*) FROM exams WHERE status='active'")[0],
+        'total_submissions': db_fetchone(conn, "SELECT COUNT(*) FROM exam_results")[0],
+        'avg_score': db_fetchone(conn, "SELECT AVG(percentage) FROM exam_results")[0] or 0,
         'pass_rate': 0
     }
-    pass_data = conn.execute("SELECT COUNT(*) as total, SUM(passed) as passed FROM exam_results").fetchone()
+    pass_data = db_fetchone(conn, "SELECT COUNT(*) as total, SUM(passed) as passed FROM exam_results")
     if pass_data['total'] > 0:
         stats['pass_rate'] = round(pass_data['passed'] / pass_data['total'] * 100, 1)
     stats['avg_score'] = round(stats['avg_score'], 1)
 
     # Per subject stats
-    subject_stats = conn.execute('''SELECT s.name_ar, s.color, COUNT(er.id) as attempts,
+    subject_stats = db_execute(conn, '''SELECT s.name_ar, s.color, COUNT(er.id) as attempts,
                                     AVG(er.percentage) as avg_score, SUM(er.passed) as passed
                                     FROM subjects s LEFT JOIN exams e ON s.id=e.subject_id
                                     LEFT JOIN exam_results er ON e.id=er.exam_id
@@ -761,14 +884,14 @@ def analytics_overview():
     stats['subject_stats'] = [dict(s) for s in subject_stats]
 
     # Recent activity
-    recent = conn.execute('''SELECT er.*, u.full_name_ar, e.title_ar, s.name_ar as subject_name
+    recent = db_execute(conn, '''SELECT er.*, u.full_name_ar, e.title_ar, s.name_ar as subject_name
                              FROM exam_results er JOIN users u ON er.student_id=u.id
                              JOIN exams e ON er.exam_id=e.id JOIN subjects s ON e.subject_id=s.id
                              ORDER BY er.submitted_at DESC LIMIT 10''').fetchall()
     stats['recent_activity'] = [dict(r) for r in recent]
 
     # Grade distribution
-    grade_dist = conn.execute('''SELECT grade_letter, COUNT(*) as count FROM exam_results GROUP BY grade_letter''').fetchall()
+    grade_dist = db_fetchall(conn, '''SELECT grade_letter, COUNT(*) as count FROM exam_results GROUP BY grade_letter''')
     stats['grade_distribution'] = [dict(g) for g in grade_dist]
 
     conn.close()
@@ -778,10 +901,10 @@ def analytics_overview():
 @token_required(['admin', 'teacher'])
 def class_analytics(class_name):
     conn = get_db()
-    students = conn.execute("SELECT * FROM users WHERE class_name=? AND role='student'", (class_name,)).fetchall()
+    students = db_fetchall(conn, "SELECT * FROM users WHERE class_name=? AND role='student'", (class_name,))
     data = []
     for st in students:
-        results = conn.execute('''SELECT er.percentage, er.grade_letter, er.passed, e.title_ar, s.name_ar as subject
+        results = db_execute(conn, '''SELECT er.percentage, er.grade_letter, er.passed, e.title_ar, s.name_ar as subject
                                   FROM exam_results er JOIN exams e ON er.exam_id=e.id
                                   JOIN subjects s ON e.subject_id=s.id
                                   WHERE er.student_id=?''', (st['id'],)).fetchall()
@@ -797,13 +920,13 @@ def student_report_pdf(sid):
     if request.user['role'] == 'student' and request.user['user_id'] != sid:
         return jsonify({'error': 'Forbidden'}), 403
     conn = get_db()
-    student = conn.execute('SELECT * FROM users WHERE id=?', (sid,)).fetchone()
-    results = conn.execute('''SELECT er.*, e.title_ar, e.total_points, e.pass_score,
+    student = db_fetchone(conn, 'SELECT * FROM users WHERE id=?', (sid,))
+    results = db_execute(conn, '''SELECT er.*, e.title_ar, e.total_points, e.pass_score,
                               s.name_ar as subject_name
                               FROM exam_results er JOIN exams e ON er.exam_id=e.id
                               JOIN subjects s ON e.subject_id=s.id
                               WHERE er.student_id=? ORDER BY er.submitted_at DESC''', (sid,)).fetchall()
-    settings = {r['key']: r['value'] for r in conn.execute('SELECT * FROM school_settings').fetchall()}
+    settings = {r['key']: r['value'] for r in db_fetchall(conn, 'SELECT * FROM school_settings')}
     conn.close()
 
     buf = io.BytesIO()
@@ -900,8 +1023,8 @@ def student_report_pdf(sid):
 @token_required(['admin', 'teacher'])
 def class_report_pdf(class_name):
     conn = get_db()
-    students = conn.execute("SELECT * FROM users WHERE class_name=? AND role='student' ORDER BY full_name_ar", (class_name,)).fetchall()
-    settings = {r['key']: r['value'] for r in conn.execute('SELECT * FROM school_settings').fetchall()}
+    students = db_fetchall(conn, "SELECT * FROM users WHERE class_name=? AND role='student' ORDER BY full_name_ar", (class_name,))
+    settings = {r['key']: r['value'] for r in db_fetchall(conn, 'SELECT * FROM school_settings')}
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=2*cm, leftMargin=2*cm,
@@ -923,7 +1046,7 @@ def class_report_pdf(class_name):
 
     table_data = [['#', 'Student Name / الاسم', 'Exams / الامتحانات', 'Avg Score / المتوسط', 'Grade / التقدير', 'Status / الحالة']]
     for i, st in enumerate(students, 1):
-        results = conn.execute('SELECT percentage, passed FROM exam_results WHERE student_id=?', (st['id'],)).fetchall()
+        results = db_fetchall(conn, 'SELECT percentage, passed FROM exam_results WHERE student_id=?', (st['id'],))
         avg = sum(r['percentage'] for r in results) / len(results) if results else 0
         grade = get_grade_letter(avg)
         passed = sum(1 for r in results if r['passed'])
@@ -966,4 +1089,5 @@ if __name__ == '__main__':
     print("  🌐 URL: http://localhost:5000")
     print("  👤 Admin: admin / admin123")
     print("="*60 + "\n")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(debug=False, host='0.0.0.0', port=port)
