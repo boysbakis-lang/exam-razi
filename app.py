@@ -297,7 +297,12 @@ def update_user(uid):
 @app.route('/api/users/<int:uid>', methods=['DELETE'])
 @auth(['admin'])
 def delete_user(uid):
-    conn=get_db(); execute(conn,'DELETE FROM users WHERE id=?',(uid,)); conn.commit(); conn.close()
+    conn=get_db()
+    # Protect the main admin account
+    u=fetchone(conn,'SELECT username FROM users WHERE id=?',(uid,))
+    if u and u['username']=='admin':
+        conn.close(); return jsonify({'error':'لا يمكن حذف المدير الرئيسي'}),403
+    execute(conn,'DELETE FROM users WHERE id=?',(uid,)); conn.commit(); conn.close()
     return jsonify({'success':True})
 
 @app.route('/api/users/import', methods=['POST'])
