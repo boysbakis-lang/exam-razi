@@ -1013,22 +1013,7 @@ canvas { max-height: 280px; }
           <button class="btn btn-blue btn-sm" onclick="exportExcel('results')"><i class="fas fa-chart-bar"></i> النتائج الكاملة</button>
         </div>
       </div>
-      <!-- Backup Bar -->
-      <div style="background:linear-gradient(135deg,#1a3a5c,#2563a8);border-radius:12px;padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;color:white">
-        <div>
-          <div style="font-weight:700;font-size:.95rem">🔒 النسخ الاحتياطي — Backup</div>
-          <div style="font-size:.78rem;opacity:.8;margin-top:2px">احفظ نسخة من جميع بياناتك أو استعدها</div>
-        </div>
-        <div style="display:flex;gap:10px">
-          <button class="btn" style="background:rgba(255,255,255,.2);color:white;border:1px solid rgba(255,255,255,.3)" onclick="downloadBackup()">
-            <i class="fas fa-download"></i> تحميل نسخة احتياطية
-          </button>
-          <button class="btn" style="background:rgba(245,158,11,.3);color:#fbbf24;border:1px solid rgba(245,158,11,.4)" onclick="document.getElementById('restore-file').click()">
-            <i class="fas fa-upload"></i> استعادة نسخة
-          </button>
-          <input type="file" id="restore-file" accept=".json" style="display:none" onchange="restoreBackup(this)">
-        </div>
-      </div>
+
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
         <div class="card" style="text-align:center;padding:32px">
           <div style="font-size:2.5rem;margin-bottom:14px">📊</div>
@@ -1119,7 +1104,7 @@ canvas { max-height: 280px; }
             <code style="font-size:.78rem">public/images/logo.png</code>
           </div>
         </div>
-        <div class="card">
+        <div class="card" id="backup-section">
           <div class="card-title" style="margin-bottom:16px"><i class="fas fa-database" style="color:var(--success)"></i> النسخ الاحتياطي</div>
           <p style="font-size:.82rem;color:var(--text-2);margin-bottom:16px">احفظ نسخة من جميع البيانات أو استعدها. النسخة الاحتياطية لا تتأثر بأي تحديث للنظام.</p>
           <div style="display:flex;flex-direction:column;gap:10px">
@@ -1621,6 +1606,11 @@ function showApp() {
       document.getElementById('admin-nav-sections').style.display = 'none';
       document.getElementById('settings-nav').style.display = 'none';
     }
+    // Hide backup from teachers — admin only
+    if (state.role !== 'admin') {
+      const backupSec = document.getElementById('backup-section');
+      if (backupSec) backupSec.style.display = 'none';
+    }
     showPage('dashboard');
     loadDashboard();
   }
@@ -1946,12 +1936,31 @@ async function importQuestions(input) {
 }
 
 // ─── BACKUP ───────────────────────────────────────────────────
-function downloadBackup() {
-  const link = document.createElement('a');
-  link.href = `/api/backup/download?token=${state.token}`;
-  link.download = `backup_${new Date().toISOString().split('T')[0]}.json`;
-  link.click();
-  toast('✅ جاري تحميل النسخة الاحتياطية...','info');
+async function downloadBackup() {
+  try {
+    toast('جاري تحضير النسخة الاحتياطية...', 'info');
+    // استخدام fetch مع Authorization header بدلاً من URL token
+    const response = await fetch('/api/backup/download', {
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + state.token }
+    });
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.error || 'فشل التحميل');
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `razi_backup_${new Date().toISOString().split('T')[0]}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    toast('✅ تم تحميل النسخة الاحتياطية بنجاح', 'success');
+  } catch(e) {
+    toast('خطأ في التحميل: ' + e.message, 'error');
+  }
 }
 
 async function restoreBackup(input) {
@@ -1959,15 +1968,16 @@ async function restoreBackup(input) {
   if (!file) return;
   showConfirm(
     'استعادة النسخة الاحتياطية',
-    '⚠️ سيتم استعادة جميع البيانات. البيانات الموجودة لن تُمسح لكن سيتم إضافة البيانات المفقودة. هل تريد المتابعة؟',
+    '⚠️ سيتم استعادة جميع البيانات المفقودة. البيانات الموجودة لن تُمسح. هل تريد المتابعة؟',
     async () => {
       const fd = new FormData();
       fd.append('file', file);
       try {
-        const r = await api('POST','/api/backup/restore',fd,true);
-        toast(`✅ تم الاستعادة: ${JSON.stringify(r.restored)}`,'info');
-        loadDashboard();
-      } catch(e) { toast(e.message,'error'); }
+        const r = await api('POST', '/api/backup/restore', fd, true);
+        const details = Object.entries(r.restored||{}).map(([k,v])=>`${k}: ${v}`).join(' | ');
+        toast(`✅ تم الاستعادة — ${details}`, 'info');
+        setTimeout(() => loadDashboard(), 1000);
+      } catch(e) { toast('خطأ في الاستعادة: ' + e.message, 'error'); }
     }, 'btn-amber'
   );
   input.value = '';
@@ -2943,28 +2953,7 @@ function exportExcel(type) {
 // ═══════════════════════════════════════════════
 //  BACKUP & RESTORE
 // ═══════════════════════════════════════════════
-function downloadBackup() {
-  const link = document.createElement('a');
-  link.href = `/api/backup/download?token=${state.token}`;
-  link.download = `backup_${new Date().toISOString().split('T')[0]}.json`;
-  document.body.appendChild(link); link.click(); document.body.removeChild(link);
-  toast('✅ جاري تحميل النسخة الاحتياطية...', 'info');
-}
 
-async function restoreBackup(input) {
-  const file = input.files[0]; if (!file) return;
-  showConfirm('استعادة النسخة الاحتياطية',
-    '⚠️ سيتم استعادة جميع البيانات المفقودة. البيانات الموجودة لن تُمسح. هل تريد المتابعة؟',
-    async () => {
-      const fd = new FormData(); fd.append('file', file);
-      try {
-        const r = await api('POST','/api/backup/restore',fd,true);
-        toast(`✅ تم الاستعادة بنجاح`,'info');
-        loadDashboard();
-      } catch(e) { toast(e.message,'error'); }
-    }, 'btn-amber');
-  input.value = '';
-}
 
 // ═══════════════════════════════════════════════
 //  COMPARISONS PAGE
