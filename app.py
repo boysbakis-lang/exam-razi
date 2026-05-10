@@ -154,7 +154,10 @@ def auth(roles=None):
     def dec(f):
         @wraps(f)
         def wrap(*a,**kw):
-            token = request.headers.get('Authorization','').replace('Bearer ','')
+            # Accept token from Authorization header OR URL ?token= param
+            token = request.headers.get('Authorization','').replace('Bearer ','').strip()
+            if not token:
+                token = request.args.get('token','').strip()
             if not token: return jsonify({'error':'No token'}),401
             try:
                 d = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
@@ -814,11 +817,14 @@ def export_excel(data_type):
     conn.close(); return jsonify({'error':'Unknown type'}),400
 
 # ── Backup & Restore ───────────────────────────────────────────
-@app.route('/api/backup/download')
+@app.route('/api/backup/download', methods=['GET'])
 @auth(['admin'])
 def backup_download():
-    conn=get_db()
-    backup={'version':'2.0','created_at':datetime.now().isoformat(),
+    try:
+        conn=get_db()
+        backup={
+            'version':'2.0',
+            'created_at':datetime.now().isoformat(),
             'school':{r['key']:r['value'] for r in fetchall(conn,'SELECT key,value FROM school_settings')},
             'users':fetchall(conn,'SELECT * FROM users'),
             'subjects':fetchall(conn,'SELECT * FROM subjects'),
@@ -827,10 +833,25 @@ def backup_download():
             'exam_access':fetchall(conn,'SELECT * FROM exam_access'),
             'exam_sessions':fetchall(conn,'SELECT * FROM exam_sessions'),
             'student_answers':fetchall(conn,'SELECT * FROM student_answers'),
-            'exam_results':fetchall(conn,'SELECT * FROM exam_results')}
-    conn.close()
-    buf=io.BytesIO(json.dumps(backup,ensure_ascii=False,indent=2).encode('utf-8')); buf.seek(0)
-    return send_file(buf,mimetype='application/json',download_name=f'backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json',as_attachment=True)
+            'exam_results':fetchall(conn,'SELECT * FROM exam_results')
+        }
+        conn.close()
+        json_data = json.dumps(backup, ensure_ascii=False, indent=2)
+        buf = io.BytesIO(json_data.encode('utf-8'))
+        buf.seek(0)
+        filename = f'razi_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+        response = send_file(
+            buf,
+            mimetype='application/json',
+            as_attachment=True,
+            download_name=filename
+        )
+        response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Expose-Headers'] = 'Content-Disposition'
+        return response
+    except Exception as e:
+        return jsonify({'error': f'خطأ في إنشاء النسخة الاحتياطية: {str(e)}'}), 500
 
 @app.route('/api/backup/restore', methods=['POST'])
 @auth(['admin'])
